@@ -17,30 +17,53 @@ from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
 import numpy as np
+import torch
 import json
 from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
-
-class CameraInfo(NamedTuple):
-    uid: int
-    R: np.array
-    T: np.array
-    FovY: np.array
-    FovX: np.array
-    image: np.array
-    image_path: str
-    image_name: str
-    width: int
-    height: int
+from scene.ellipse_utils import generate_ellipse_path_from_camera_infos
+from utils.camera_utils import CameraInfo
+import pickle
+from tqdm import tqdm
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
     train_cameras: list
     test_cameras: list
+    render_cameras: list
     nerf_normalization: dict
     ply_path: str
+
+def load_intrinsics_pickle(path):
+    with open(path, 'rb') as f:
+        intrinsics = pickle.load(f)['intrinsics']
+    return intrinsics
+
+def load_poses_pickle(path): #read poses in pytorch3d format
+    with open(path, 'rb') as f:
+        camera_poses = pickle.load(f)['poses']
+    poses = {}
+
+    for key in tqdm(camera_poses.keys(), desc='Reading cameras'):
+            poses[key] = torch.from_numpy(camera_poses[key])
+        
+    return poses
+
+def opencv_from_cameras_projection(camera_pose):
+    R_pytorch3d = camera_pose[:3, :3].clone()
+    T_pytorch3d = camera_pose[:3, 3].clone()
+
+    T_pytorch3d[:2] *= -1
+    R_pytorch3d[:, :2] *= -1
+    tvec = T_pytorch3d
+
+    R = R_pytorch3d.permute(1, 0)
+    rt = torch.cat([R, tvec.unsqueeze(1)], dim=1)
+    rt = torch.cat([rt, torch.tensor([[0, 0, 0, 1]], device=rt.device)], dim=0)
+    
+    return rt.cpu().numpy()
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -103,6 +126,120 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
+
+def readPytorchSceneInfo(path, eval, all_args, llffhold=8):
+    pickle_path_train = os.path.join(path, "images/train/camera_train.pickle")
+    pickle_path_test = os.path.join(path, "images/test/camera_test.pickle")
+
+    cam_intrinsics = load_intrinsics_pickle(pickle_path_train) #read intrinsics from pytorch pickle file
+    cam_extrinsics_train = load_poses_pickle(pickle_path_train) #read poses from pytorch pickle file and return in opencv/colmap format
+    cam_extrinsics_test = load_poses_pickle(pickle_path_test) 
+
+    reading_dir = "images" 
+    cam_infos_unsorted_train = readPytorchCameras(cam_extrinsics=cam_extrinsics_train, cam_intrinsics=cam_intrinsics, 
+                                           images_folder=os.path.join(path, reading_dir), split='train')
+    cam_infos_train = sorted(cam_infos_unsorted_train.copy(), key = lambda x : x.image_name)
+
+    cam_infos_unsorted_test = readPytorchCameras(cam_extrinsics=cam_extrinsics_test, cam_intrinsics=cam_intrinsics, 
+                                           images_folder=os.path.join(path, reading_dir), split='test')
+    cam_infos_test = sorted(cam_infos_unsorted_test.copy(), key = lambda x : x.image_name)
+
+    #img_to_keep = ['000.png', '015.png', '030.png', '045.png']
+    #img_to_keep = ['000.jpg', '041.jpg', '082.jpg', '125.jpg']
+    #img_to_keep = ['000.png', '015.png', '030.png', '045.png','060.png', '075.png', '090.png', '105.png']
+    #train_cam_infos = [cam_info for cam_info in cam_infos_train if cam_info.image_name in img_to_keep]
+    train_cam_infos = cam_infos_train
+    test_cam_infos = cam_infos_test
+
+    render_cam_infos = generate_ellipse_path_from_camera_infos(cam_infos_train)
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    print(nerf_normalization)
+    ply_path = all_args.ply_path
+    if not os.path.exists(ply_path):
+        ply_path = os.path.join(path, "sparse_colmap/0/points3D.ply")
+    bin_path = os.path.join(path, "sparse_colmap/0/points3D.bin")
+    txt_path = os.path.join(path, "sparse_colmap/0/points3D.txt")
+
+    if not os.path.exists(ply_path):
+        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        try:
+            xyz, rgb, _ = read_points3D_binary(bin_path)
+        except:
+            xyz, rgb, _ = read_points3D_text(txt_path)
+        storePly(ply_path, xyz, rgb)
+    print('Reading ply file from: {0}'.format(ply_path))
+    pcd = fetchPly(ply_path)
+
+    #train_cam_infos = random.sample(train_cam_infos, k=int(len(train_cam_infos)*all_args.image_perc))
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           render_cameras=render_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    print('Num of train cameras: {0}'.format(len(train_cam_infos))) 
+    print('Num of test cameras: {0}'.format(len(test_cam_infos))) 
+
+    return scene_info
+
+
+def readPytorchCameras(cam_extrinsics, cam_intrinsics, images_folder, split):
+    cam_infos = []
+
+    images_files = sorted(os.listdir(images_folder + '/' + split + '/images'))
+
+    width = int(cam_intrinsics[0,2] * 2)
+    height = int(cam_intrinsics[1,2] * 2)
+
+    focal_length_x = cam_intrinsics[0,0]
+    FovY = focal2fov(focal_length_x, height)
+    FovX = focal2fov(focal_length_x, width)
+
+    depth_path = images_folder + '/' + split + '/depths'
+    weight_path = images_folder + '/' + split + '/weights'
+
+    for i, n in enumerate(sorted(cam_extrinsics.keys())):
+        curr_pose = cam_extrinsics[n]
+
+        image_path = os.path.join(images_folder + '/' + split + '/images', n)
+        image_name = os.path.basename(image_path)#.split(".")[0]
+        image = Image.open(image_path)
+        
+        curr_pose = opencv_from_cameras_projection(curr_pose).astype(np.float64)
+
+        R = curr_pose[:3, :3]
+        R = np.transpose(R)
+        T = curr_pose[:3, 3]
+
+        mask_path = os.path.join(images_folder + '/' + split + '/masks', images_files[i].replace('png','npy'))
+        if os.path.exists(mask_path):
+            mask = np.load(mask_path).astype(np.uint8)
+        else:
+            mask = None 
+
+        if os.path.exists(depth_path):
+            #depth_map = cv2.imread(os.path.join(depth_path, images_files[i].replace('png','npy')), cv2.IMREAD_ANYDEPTH) / 1000
+            depth_map = np.load(os.path.join(depth_path, images_files[i].replace('png','npy')))#.astype(np.float64)
+        else:
+            depth_map = None
+
+
+        if os.path.exists(weight_path):
+            #depth_map = cv2.imread(os.path.join(depth_path, images_files[i].replace('png','npy')), cv2.IMREAD_ANYDEPTH) / 1000
+            weight_map = np.load(os.path.join(weight_path, images_files[i].replace('png','npy')))#.astype(np.float64)
+        else:
+            weight_map = None
+
+        cam_info = CameraInfo(uid=n, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                                image_path=image_path, image_name=image_name, width=width, height=height, 
+                                image_mask=mask, mask_path=mask_path, depth_map=depth_map, weight_map=weight_map)
+
+        cam_infos.append(cam_info)
+
+    sys.stdout.write('\n')
+    return cam_infos
+
 
 def fetchPly(path):
     plydata = PlyData.read(path)
@@ -214,13 +351,17 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             FovX = fovx
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], mask_path=''))
             
     return cam_infos
 
 def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
+
+    img_to_keep = ['rgb_000', 'rgb_050', 'rgb_100', 'rgb_150']
+    train_cam_infos = [cam_info for cam_info in train_cam_infos if cam_info.image_name in img_to_keep]
+    
     print("Reading Test Transforms")
     test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
     
@@ -247,14 +388,18 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
     except:
         pcd = None
 
+    render_cam_infos = generate_ellipse_path_from_camera_infos(train_cam_infos)
+
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
+                            render_cameras=render_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path)
     return scene_info
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "Pytorch" : readPytorchSceneInfo
 }
