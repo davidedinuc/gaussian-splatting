@@ -59,6 +59,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--torch_data", action="store_true")
     parser.add_argument('--ply_path', type=str, default='')
+    parser.add_argument('--random_ply', action="store_true")
 
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)

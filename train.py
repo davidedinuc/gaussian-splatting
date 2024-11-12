@@ -15,7 +15,7 @@ from random import randint
 from utils.graphics_utils import focal2fov, fov2focal, getProjectionMatrix
 import subprocess
 import torchvision
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -33,6 +33,20 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+import random
+
+def set_seed(seed):
+    print(f'Setting seed {seed}...')
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+    print('...Done')
 
 def training(dataset, opt, pipe, all_args, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
@@ -54,6 +68,9 @@ def training(dataset, opt, pipe, all_args, testing_iterations, saving_iterations
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+
+    l1_loss = torch.nn.L1Loss(reduction='none')
+    
     for iteration in range(first_iter, opt.iterations + 1):        
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -97,40 +114,16 @@ def training(dataset, opt, pipe, all_args, testing_iterations, saving_iterations
         if all_args.mask_loss:
             mask = torch.from_numpy(viewpoint_cam.image_mask).to(image.device)
             weights = torch.from_numpy(viewpoint_cam.weight_map).to(image.device)
-
-            if all_args.depth_loss:
-                target_depth_map = torch.from_numpy(viewpoint_cam.depth_map).to(image.device) #* gaussians.depth_scale + gaussians.depth_offset
-                #depth_mask = target_depth_map > 0 & mask 
-
-                # Normalize depth maps
-                target_depth_map = (target_depth_map - target_depth_map.min()) / (target_depth_map.max() - target_depth_map.min())
-                render_pkg_depth = (render_pkg['depth_map'] - render_pkg['depth_map'].min()) / (render_pkg['depth_map'].max() - render_pkg['depth_map'].min())
-
-                #depth_loss = torch.sqrt(torch.mean((render_pkg_depth[mask.bool().squeeze()] - target_depth_map[mask.bool().squeeze()]) ** 2))
-                depth_loss = torch.sqrt(torch.mean((render_pkg_depth[mask.bool()] - target_depth_map[mask.bool()]) ** 2))
-
+            #weights = torch.ones_like(mask)
+            Ll1 = (l1_loss(image[:,mask.bool().squeeze()], gt_image[:,mask.bool().squeeze()]) * weights[mask > 0]).mean()
+            if mask.sum() == mask.numel():
+                loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image*mask, gt_image*mask))
             else:
-                depth_loss = 0
-
-            try:
-                Ll1 = l1_loss(image[:,mask.bool().squeeze()], gt_image[:,mask.bool().squeeze()] * weights[mask > 0])
-            except:
-                breakpoint()
-            #Ll1 = l1_loss(image * mask, gt_image * mask) / mask.sum()
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image*mask, gt_image*mask)) + depth_loss * args.depth_loss_weight
-            #if iteration > 1000 and iteration % 125 == 0:
-            #    concat_images([gt_image, image, image*mask]).save(f'/home/ddinucci/Desktop/gaussian-splatting/output/test_xor_2/{iteration}.png')
-            #Ll1 = l1_loss(image * mask, gt_image * mask) / mask.sum()
-
-            if iteration % 250 == 0:
-                Image.fromarray(((gt_image * (mask)).permute(1,2,0).cpu().numpy()*255).astype(np.uint8)).save(f'/home/ddinucci/Desktop/gaussian-splatting/check/gt_masked/{iteration}.png')
-                Image.fromarray((((mask)).cpu().numpy()*255).astype(np.uint8)).save(f'/home/ddinucci/Desktop/gaussian-splatting/check/mask/mask_{iteration}_id_{viewpoint_cam.uid}.png')
+                loss = Ll1 
         else:
-        #    if iteration > 1000 and iteration % 250 == 0:
-        #        concat_images([gt_image, image]).save(f'/home/ddinucci/Desktop/gaussian-splatting/output/test_xor/{iteration}.png')
-            Ll1 = l1_loss(image, gt_image)
+            Ll1 = l1_loss(image, gt_image).mean()
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        
+
         loss.backward()
         iter_end.record()
 
@@ -171,7 +164,7 @@ def training(dataset, opt, pipe, all_args, testing_iterations, saving_iterations
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
     #RENDER THE VIDEO
-    render_path(dataset, iteration, pipe, all_args, render_resize_method='crop')
+    #render_path(dataset, iteration, pipe, all_args, render_resize_method='crop')
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -311,13 +304,14 @@ if __name__ == "__main__":
     parser.add_argument('--depth_loss', action="store_true")
     parser.add_argument('--depth_loss_weight', type=float, default=1.0)
     parser.add_argument('--ply_path', type=str, default='')
+    parser.add_argument('--random_ply', action="store_true")
     parser.add_argument("--torch_data", action="store_true")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     print(args.mask_loss)
     print("Optimizing " + args.model_path)
-
+    set_seed(1518)
     # Initialize system state (RNG)
     safe_state(args.quiet)
 

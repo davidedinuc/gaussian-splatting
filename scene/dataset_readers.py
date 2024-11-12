@@ -161,13 +161,31 @@ def readPytorchSceneInfo(path, eval, all_args, llffhold=8):
     bin_path = os.path.join(path, "sparse_colmap/0/points3D.bin")
     txt_path = os.path.join(path, "sparse_colmap/0/points3D.txt")
 
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+    
+    if all_args.random_ply:
+        #print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        #try:
+        #    xyz, rgb, _ = read_points3D_binary(bin_path)
+        #except:
+        #    xyz, rgb, _ = read_points3D_text(txt_path)
+        #storePly(ply_path, xyz, rgb)
+            # Since this data set has no colmap data, we start with random points
+        num_pts = 100_000
+        print(f"Generating random point cloud ({num_pts})...")
+        
+        # We create random points inside the bounds of the synthetic Blender scenes
+        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+        
+        ply_path = os.path.join(path, "sparse_colmap/0/points3D_random.ply")
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+
         try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
+            pcd = fetchPly(ply_path)
         except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
+            pcd = None
+
     print('Reading ply file from: {0}'.format(ply_path))
     pcd = fetchPly(ply_path)
 
@@ -223,7 +241,6 @@ def readPytorchCameras(cam_extrinsics, cam_intrinsics, images_folder, split):
             depth_map = np.load(os.path.join(depth_path, images_files[i].replace('png','npy')))#.astype(np.float64)
         else:
             depth_map = None
-
 
         if os.path.exists(weight_path):
             #depth_map = cv2.imread(os.path.join(depth_path, images_files[i].replace('png','npy')), cv2.IMREAD_ANYDEPTH) / 1000
@@ -305,6 +322,24 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         pcd = fetchPly(ply_path)
     except:
         pcd = None
+
+
+    #ply_path = os.path.join(path, "points3d.ply")
+    #if not os.path.exists(ply_path):
+    # Since this data set has no colmap data, we start with random points
+    #num_pts = 100_000
+    #print(f"Generating random point cloud ({num_pts})...")
+    #    
+    #    # We create random points inside the bounds of the synthetic Blender scenes
+    #xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+    #shs = np.random.random((num_pts, 3)) / 255.0
+    #pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+
+    #storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    #try:
+    #    pcd = fetchPly(ply_path)
+    #except:
+    #    pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
