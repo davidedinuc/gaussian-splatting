@@ -7,7 +7,6 @@
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
-#
 
 import os
 import torch
@@ -99,7 +98,6 @@ def training(dataset, opt, pipe, all_args, testing_iterations, saving_iterations
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
@@ -112,14 +110,14 @@ def training(dataset, opt, pipe, all_args, testing_iterations, saving_iterations
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         if all_args.mask_loss:
-            mask = torch.from_numpy(viewpoint_cam.image_mask).to(image.device)
+            mask =  torch.from_numpy(viewpoint_cam.image_mask).to(image.device)
             weights = torch.from_numpy(viewpoint_cam.weight_map).to(image.device)
-            #weights = torch.ones_like(mask)
+            #weights = torch.ones_like(mask).to(image.device)
             Ll1 = (l1_loss(image[:,mask.bool().squeeze()], gt_image[:,mask.bool().squeeze()]) * weights[mask > 0]).mean()
-            if mask.sum() == mask.numel():
-                loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image*mask, gt_image*mask))
-            else:
-                loss = Ll1 
+            #if mask.sum() == mask.numel():
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image*mask, gt_image*mask))
+            #else:
+            #loss = Ll1 
         else:
             Ll1 = l1_loss(image, gt_image).mean()
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
@@ -151,7 +149,7 @@ def training(dataset, opt, pipe, all_args, testing_iterations, saving_iterations
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
